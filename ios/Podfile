@@ -109,7 +109,10 @@ post_install do |installer|
         
         # Fix for Privacy Manifests (url_launcher issue)
         config.build_settings.delete('GENERATE_INFOPLIST_FILE')
-        config.build_settings.delete('SKIP_INSTALL')
+        # CRITICAL: Set SKIP_INSTALL=YES for Pod targets to prevent "Generic Xcode Archive"
+        # This ensures only the Runner app is included in the archive for IPA export
+        # Reference: Apple TN3110, Flutter issue #66619
+        config.build_settings['SKIP_INSTALL'] = 'YES'
         config.build_settings.delete('BUILD_LIBRARY_FOR_DISTRIBUTION')
         
         # Plugin-specific fixes
