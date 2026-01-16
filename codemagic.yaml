@@ -1,0 +1,234 @@
+# Codemagic iOS Build Configuration
+workflows:
+  ios-debug-build:
+    name: iOS Debug Build
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    
+    environment:
+      ios_signing:
+        distribution_type: development
+        bundle_identifier: com.hggzk.app
+      flutter: stable
+      xcode: 15.0
+      cocoapods: default
+      
+      vars:
+        # Environment variables
+        LANG: en_US.UTF-8
+        LANGUAGE: en_US.UTF-8
+        LC_ALL: en_US.UTF-8
+        COCOAPODS_DISABLE_STATS: "true"
+    
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: '*'
+          include: true
+    
+    scripts:
+      # === STEP 1: Environment Setup ===
+      - name: Show environment info
+        script: |
+          echo "========================================="
+          echo "📊 ENVIRONMENT INFORMATION"
+          echo "========================================="
+          flutter --version
+          pod --version
+          xcodebuild -version
+          ruby --version
+          echo "========================================="
+          
+      # === STEP 2: Configure code signing ===
+      - name: Configure code signing
+        script: |
+          echo "🔐 Configuring code signing..."
+          xcode-project use-profiles
+          
+      # === STEP 3: Clean everything ===
+      - name: Deep clean
+        script: |
+          echo "🧹 Deep cleaning build environment..."
+          
+          # Clean Xcode derived data
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+          
+          # Clean iOS build artifacts
+          cd ios
+          rm -rf build
+          rm -rf Pods
+          rm -f Podfile.lock
+          rm -rf .symlinks
+          pod cache clean --all --verbose
+          cd ..
+          
+          # Clean Flutter artifacts
+          flutter clean
+          rm -rf .dart_tool
+          rm -rf build
+          
+          echo "✅ Cleaning completed"
+          
+      # === STEP 4: Get Flutter dependencies ===
+      - name: Get Flutter dependencies
+        script: |
+          echo "📦 Getting Flutter dependencies..."
+          flutter pub get
+          
+      # === STEP 5: Fix iOS configuration ===
+      - name: Configure iOS settings
+        script: |
+          echo "⚙️ Configuring iOS settings..."
+          
+          # Add Swift settings to Generated.xcconfig
+          echo "SWIFT_VERSION = 5.0" >> ios/Flutter/Generated.xcconfig
+          echo "SWIFT_COMPILATION_MODE = singlefile" >> ios/Flutter/Generated.xcconfig
+          echo "SWIFT_OPTIMIZATION_LEVEL = -Onone" >> ios/Flutter/Generated.xcconfig
+          echo "ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES" >> ios/Flutter/Generated.xcconfig
+          
+          echo "✅ iOS configuration updated"
+          
+      # === STEP 6: Update CocoaPods ===
+      - name: Update CocoaPods repos
+        script: |
+          echo "🔄 Updating CocoaPods repositories..."
+          pod repo update --verbose
+          
+      # === STEP 7: Install iOS dependencies ===
+      - name: Install iOS dependencies
+        script: |
+          echo "📱 Installing iOS dependencies..."
+          cd ios
+          
+          # Ensure Podfile exists
+          if [ ! -f "Podfile" ]; then
+            echo "❌ ERROR: Podfile not found!"
+            exit 1
+          fi
+          
+          # Install pods
+          pod install --repo-update --verbose
+          
+          # Show installed pods
+          echo "📋 Installed pods:"
+          pod list --verbose
+          
+          cd ..
+          echo "✅ iOS dependencies installed"
+          
+      # === STEP 8: Fix privacy bundle issues ===
+      - name: Fix privacy bundle issues
+        script: |
+          echo "🔧 Fixing privacy bundle issues..."
+          
+          cd ios
+          
+          # Function to clean privacy bundles from a project file
+          clean_project_file() {
+            local file="$1"
+            if [ -f "$file" ]; then
+              echo "Cleaning: $file"
+              
+              # Backup original
+              cp "$file" "${file}.backup"
+              
+              # Remove privacy bundle references
+              sed -i '' '/_privacy\.bundle/d' "$file"
+              sed -i '' '/PrivacyInfo\.xcprivacy/d' "$file"
+              sed -i '' '/privacy_bundle/d' "$file"
+              
+              # Count remaining references
+              local count=$(grep -c "privacy" "$file" || echo "0")
+              echo "  Remaining privacy references: $count"
+            fi
+          }
+          
+          # Clean Runner project
+          clean_project_file "Runner.xcodeproj/project.pbxproj"
+          
+          # Clean Pods project if exists
+          if [ -f "Pods/Pods.xcodeproj/project.pbxproj" ]; then
+            clean_project_file "Pods/Pods.xcodeproj/project.pbxproj"
+          fi
+          
+          # Remove physical privacy bundle directories
+          find . -name "*privacy.bundle" -type d -exec rm -rf {} + 2>/dev/null || true
+          find . -name "PrivacyInfo.xcprivacy" -type f -delete 2>/dev/null || true
+          
+          cd ..
+          echo "✅ Privacy bundle issues fixed"
+          
+      # === STEP 9: Verify project integrity ===
+      - name: Verify project configuration
+        script: |
+          echo "🔍 Verifying project configuration..."
+          
+          cd ios
+          
+          # Check if workspace exists
+          if [ ! -d "Runner.xcworkspace" ]; then
+            echo "❌ ERROR: Runner.xcworkspace not found!"
+            exit 1
+          fi
+          
+          # Show build settings
+          xcodebuild -workspace Runner.xcworkspace \
+                     -scheme Runner \
+                     -configuration Debug \
+                     -sdk iphoneos \
+                     -showBuildSettings | grep -E "SWIFT_VERSION|DEPLOYMENT_TARGET|PRODUCT_BUNDLE_IDENTIFIER"
+          
+          cd ..
+          echo "✅ Project verification completed"
+          
+      # === STEP 10: Build iOS app ===
+      - name: Build iOS Debug IPA
+        script: |
+          echo "========================================="
+          echo "🏗️  BUILDING iOS DEBUG IPA"
+          echo "========================================="
+          
+          # Build with verbose output for debugging
+          flutter build ipa \
+            --debug \
+            --export-options-plist /Users/builder/export_options.plist \
+            --verbose
+          
+          echo "========================================="
+          echo "✅ BUILD COMPLETED"
+          echo "========================================="
+          
+      # === STEP 11: Verify build output ===
+      - name: Verify build artifacts
+        script: |
+          echo "📦 Checking build artifacts..."
+          
+          if [ -f "build/ios/ipa/*.ipa" ]; then
+            echo "✅ IPA file found:"
+            ls -la build/ios/ipa/
+          else
+            echo "❌ No IPA file found!"
+            exit 1
+          fi
+          
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - build/ios/archive/Runner.xcarchive
+      - ios/Runner.xcodeproj/project.pbxproj.backup
+      
+    publishing:
+      email:
+        recipients:
+          - ameenmamwn7@gmail.com
+        notify:
+          success: true
+          failure: true
+      
+      # Slack notification (optional)
+      # slack:
+      #   channel: '#builds'
+      #   notify_on:
+      #     - success
+      #     - failure

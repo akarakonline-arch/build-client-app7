@@ -1,0 +1,448 @@
+name: iOS (macOS)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'Enable SSH debug session (tmate). Only works for workflow_dispatch.'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  ios-build:
+    runs-on: macos-latest  # أحدث macOS runner متاح
+    timeout-minutes: 60
+    env:
+      COCOAPODS_DISABLE_STATS: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.1.1'
+
+      - name: Verify Xcode version
+        run: |
+          echo "✅ Selected Xcode version:"
+          xcodebuild -version
+          echo ""
+          echo "Developer Directory:"
+          xcode-select -p
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup App Store Connect API Key (للتوقيع التلقائي)
+        env:
+          API_KEY_BASE64: ${{ secrets.APPSTORE_API_KEY_BASE64 }}
+          API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          echo "--- Setting up App Store Connect API ---"
+          
+          # إنشاء المجلد للـ API keys
+          mkdir -p ~/private_keys
+          
+          # فك تشفير الـ API key من base64
+          if [ -n "${API_KEY_BASE64:-}" ]; then
+            echo "$API_KEY_BASE64" | base64 -d > ~/private_keys/AuthKey_${API_KEY_ID}.p8
+            chmod 600 ~/private_keys/AuthKey_${API_KEY_ID}.p8
+            echo "✅ App Store Connect API Key configured"
+            echo "Key ID: $API_KEY_ID"
+            echo "Issuer ID: $API_ISSUER_ID"
+            
+            # حفظ المعلومات لاستخدامها لاحقاً
+            echo "API_KEY_PATH=~/private_keys/AuthKey_${API_KEY_ID}.p8" >> "$GITHUB_ENV"
+          else
+            echo "⚠️  App Store Connect API Key not provided"
+            echo "⚠️  Will fallback to manual signing"
+            echo "API_KEY_PATH=" >> "$GITHUB_ENV"
+          fi
+
+      - name: SSH debug (tmate)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ssh }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Install CocoaPods
+        run: |
+          if ! command -v pod >/dev/null; then
+            sudo gem install cocoapods
+          fi
+          pod --version
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            ~/.cocoapods
+          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile', 'pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Flutter clean
+        run: flutter clean
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # - name: Run tests
+      #   run: flutter test
+
+      - name: Pod install
+        run: |
+          rm -rf ios/Pods ios/Podfile.lock ios/.symlinks
+          cd ios
+          pod install --repo-update
+
+      - name: Build iOS (PR - no codesign)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: flutter build ios --release --no-codesign
+
+      - name: Setup iOS code signing (keychain + provisioning profile)
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          # تنظيف كلمات المرور من أي مسافات أو أحرف خفية
+          IOS_P12_PASSWORD_CLEAN="$(printf %s "$IOS_P12_PASSWORD" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          KEYCHAIN_PASSWORD_CLEAN="$(printf %s "$KEYCHAIN_PASSWORD" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          
+          # التحقق من وجود Secrets
+          if [ -z "${IOS_P12_PASSWORD_CLEAN:-}" ]; then
+            echo "❌ Missing or empty secret: IOS_P12_PASSWORD"
+            exit 1
+          fi
+          if [ -z "${KEYCHAIN_PASSWORD_CLEAN:-}" ]; then
+            echo "❌ Missing or empty secret: IOS_KEYCHAIN_PASSWORD"
+            exit 1
+          fi
+          
+          # استخدام الملف من الريبو مباشرة
+          CERT_P12="cer_ios/ios_development.p12"
+          PROFILE="cer_ios/Provision_Profile_2.mobileprovision"
+          
+          if [ ! -f "$CERT_P12" ]; then
+            echo "❌ Missing certificate file: $CERT_P12"
+            exit 1
+          fi
+          if [ ! -f "$PROFILE" ]; then
+            echo "❌ Missing provisioning profile: $PROFILE"
+            exit 1
+          fi
+          
+          echo "--- Certificate file info ---"
+          ls -lh "$CERT_P12"
+          file "$CERT_P12"
+          shasum -a 256 "$CERT_P12"
+          
+          # اختبار كلمة المرور مع OpenSSL أولاً
+          echo ""
+          echo "--- Testing password with OpenSSL ---"
+          if openssl pkcs12 -in "$CERT_P12" -noout -info -passin pass:"$IOS_P12_PASSWORD_CLEAN" 2>&1 | head -10; then
+            echo "✅ OpenSSL: Password verified successfully"
+          else
+            echo "❌ OpenSSL: Password verification failed"
+            exit 1
+          fi
+          
+          # إنشاء keychain
+          echo ""
+          echo "--- Creating keychain ---"
+          security create-keychain -p "$KEYCHAIN_PASSWORD_CLEAN" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD_CLEAN" build.keychain
+          security list-keychains -d user -s build.keychain
+          echo "✅ Keychain created and configured"
+          
+          # الحل الجذري: استيراد الشهادة والمفتاح بشكل منفصل (PEM format)
+          # هذا يتجنب مشاكل PKCS#12 مع security على macOS تماماً
+          echo ""
+          echo "--- Extracting certificate and private key (PEM format) ---"
+          
+          CERT_PEM="$RUNNER_TEMP/cert.pem"
+          KEY_PEM="$RUNNER_TEMP/key.pem"
+          CA_CERTS="$RUNNER_TEMP/ca.pem"
+          
+          # استخراج الشهادة
+          openssl pkcs12 -in "$CERT_P12" -clcerts -nokeys -out "$CERT_PEM" \
+            -passin pass:"$IOS_P12_PASSWORD_CLEAN"
+          
+          # استخراج المفتاح الخاص (بدون تشفير باستخدام -nodes)
+          openssl pkcs12 -in "$CERT_P12" -nocerts -nodes -out "$KEY_PEM" \
+            -passin pass:"$IOS_P12_PASSWORD_CLEAN"
+          
+          # استخراج CA certificates (إن وُجدت)
+          openssl pkcs12 -in "$CERT_P12" -cacerts -nokeys -out "$CA_CERTS" \
+            -passin pass:"$IOS_P12_PASSWORD_CLEAN" 2>/dev/null || true
+          
+          echo "✅ Extracted certificate and key to PEM format"
+          ls -lh "$CERT_PEM" "$KEY_PEM"
+          
+          # استيراد الشهادة للـ keychain
+          echo ""
+          echo "--- Importing certificate to keychain ---"
+          if security import "$CERT_PEM" -k build.keychain -T /usr/bin/codesign -T /usr/bin/security; then
+            echo "✅ Certificate imported"
+          else
+            echo "❌ Certificate import failed"
+            exit 1
+          fi
+          
+          # استيراد المفتاح الخاص للـ keychain
+          echo "--- Importing private key to keychain ---"
+          if security import "$KEY_PEM" -k build.keychain -T /usr/bin/codesign -T /usr/bin/security -A; then
+            echo "✅ Private key imported"
+          else
+            echo "❌ Private key import failed"
+            exit 1
+          fi
+          
+          # استيراد CA certificates إن وُجدت
+          if [ -s "$CA_CERTS" ]; then
+            echo "--- Importing CA certificates ---"
+            security import "$CA_CERTS" -k build.keychain -T /usr/bin/codesign -T /usr/bin/security 2>/dev/null || echo "⚠️  CA import skipped"
+          fi
+          
+          # إعداد الوصول
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD_CLEAN" build.keychain
+          
+          echo ""
+          echo "--- Code signing identities ---"
+          security find-identity -v -p codesigning build.keychain
+          
+          # معالجة provisioning profile
+          echo ""
+          echo "--- Installing provisioning profile ---"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
+          
+          # اكتشاف نوع provisioning profile تلقائياً
+          echo "--- Detecting provisioning profile type ---"
+          
+          HAS_DEVICES="false"
+          GET_TASK_ALLOW="unknown"
+          
+          if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$PROFILE_PLIST" &>/dev/null; then
+            HAS_DEVICES="true"
+            DEVICE_COUNT=$(/usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$PROFILE_PLIST" 2>/dev/null | grep -c "Dict" || echo "0")
+            echo "ProvisionedDevices: YES (count: $DEVICE_COUNT)"
+          else
+            echo "ProvisionedDevices: NO (App Store profile)"
+          fi
+          
+          GET_TASK_ALLOW_VALUE=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || echo "not_found")
+          echo "get-task-allow: $GET_TASK_ALLOW_VALUE"
+          
+          if [ "$HAS_DEVICES" = "true" ]; then
+            if [ "$GET_TASK_ALLOW_VALUE" = "true" ]; then
+              EXPORT_METHOD="development"
+              echo "✅ Detected: Development provisioning profile"
+            else
+              EXPORT_METHOD="ad-hoc"
+              echo "✅ Detected: Ad-Hoc provisioning profile"
+            fi
+          else
+            EXPORT_METHOD="app-store"
+            echo "✅ Detected: App Store provisioning profile"
+          fi
+          
+          echo "Profile Name: $PROFILE_NAME"
+          echo "Profile UUID: $PROFILE_UUID"
+          echo "Team ID: $TEAM_ID"
+          echo "Export Method: $EXPORT_METHOD"
+          
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          echo "EXPORT_METHOD=$EXPORT_METHOD" >> "$GITHUB_ENV"
+          
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          
+          echo ""
+          echo "✅ iOS code signing setup completed successfully"
+
+      - name: Build IPA (Automatic Signing with API Key)
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          BUNDLE_ID: com.hggzk.app
+          API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          
+          echo "==================================="
+          echo "🚀 Building IPA with Automatic Signing"
+          echo "==================================="
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Export Method: development (ad-hoc profile detected)"
+          echo "Signing: Automatic (using App Store Connect API)"
+          echo "Installable on: All registered devices in provisioning profile"
+          echo ""
+          
+          # تحديد طريقة التوقيع
+          USE_API_KEY=false
+          if [ -n "${API_KEY_PATH:-}" ] && [ -f "${API_KEY_PATH}" ]; then
+            USE_API_KEY=true
+            echo "✅ App Store Connect API Key found - Using Automatic Signing"
+          else
+            echo "⚠️  App Store Connect API Key not found - Using Manual Signing"
+          fi
+          
+          echo ""
+          echo "--- Building Archive ---"
+          
+          if [ "$USE_API_KEY" = true ]; then
+            # Build with automatic signing + API Key
+            xcodebuild -workspace ios/Runner.xcworkspace \
+              -scheme Runner \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/Runner.xcarchive \
+              -authenticationKeyPath "${API_KEY_PATH}" \
+              -authenticationKeyID "$API_KEY_ID" \
+              -authenticationKeyIssuerID "$API_ISSUER_ID" \
+              CODE_SIGN_STYLE=Automatic \
+              SKIP_INSTALL=NO \
+              -allowProvisioningUpdates \
+              archive
+          else
+            # Fallback to manual signing
+            # استخراج معلومات من provisioning profile
+            PROFILE="cer_ios/Provision_Profile_2.mobileprovision"
+            PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+            security cms -D -i "$PROFILE" > "$PROFILE_PLIST"
+            
+            TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
+            PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+            
+            echo "Team ID: $TEAM_ID"
+            echo "Profile Name: $PROFILE_NAME"
+            
+            xcodebuild -workspace ios/Runner.xcworkspace \
+              -scheme Runner \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -archivePath build/Runner.xcarchive \
+              DEVELOPMENT_TEAM="$TEAM_ID" \
+              CODE_SIGN_STYLE=Manual \
+              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+              SKIP_INSTALL=NO \
+              archive
+          fi
+          
+          echo ""
+          echo "✅ Archive created successfully"
+          
+          # معلومات عن الـ archive
+          if [ -d "build/Runner.xcarchive/Products/Applications/Runner.app" ]; then
+            echo ""
+            echo "--- App Info ---"
+            codesign -dv "build/Runner.xcarchive/Products/Applications/Runner.app" 2>&1 | grep -E "Authority|TeamIdentifier|Identifier" || true
+          fi
+          
+          echo ""
+          echo "--- Exporting IPA ---"
+          
+          # إنشاء ExportOptions.plist
+          EXPORT_OPTIONS_PLIST="$RUNNER_TEMP/ExportOptions.plist"
+          
+          # تحديد export method - استخدام development
+          # Note: "debugging" is not supported yet despite Apple documentation
+          EXPORT_METHOD="development"
+          
+          echo "Export Method: $EXPORT_METHOD"
+          echo ""
+          
+          # إنشاء ExportOptions.plist باستخدام defaults write
+          # ثم تحويله إلى XML format (xcodebuild يحتاج XML وليس binary)
+          
+          EXPORT_OPTIONS_PLIST="$RUNNER_TEMP/ExportOptions.plist"
+          
+          # حذف الملف إن وُجد
+          rm -f "$EXPORT_OPTIONS_PLIST"
+          
+          # إنشاء plist باستخدام defaults (أكثر موثوقية من PlistBuddy)
+          defaults write "$RUNNER_TEMP/ExportOptions" teamID "$TEAM_ID"
+          defaults write "$RUNNER_TEMP/ExportOptions" method "$EXPORT_METHOD"
+          defaults write "$RUNNER_TEMP/ExportOptions" signingStyle "manual"
+          defaults write "$RUNNER_TEMP/ExportOptions" compileBitcode -bool false
+          defaults write "$RUNNER_TEMP/ExportOptions" uploadSymbols -bool false
+          defaults write "$RUNNER_TEMP/ExportOptions" stripSwiftSymbols -bool true
+          
+          # إضافة provisioningProfiles dictionary
+          defaults write "$RUNNER_TEMP/ExportOptions" provisioningProfiles -dict-add "$BUNDLE_ID" "$PROFILE_UUID"
+          
+          # CRITICAL FIX: Convert binary plist to XML format
+          # defaults write creates binary plist, but xcodebuild expects XML format
+          # This fixes: "exportOptionsPlist error for key 'method': expected one {}"
+          # Reference: https://openradar.appspot.com/22740827
+          plutil -convert xml1 "$EXPORT_OPTIONS_PLIST"
+          
+          echo "--- ExportOptions.plist (defaults method) ---"
+          plutil -p "$EXPORT_OPTIONS_PLIST"
+          echo ""
+          
+          # Export IPA
+          if [ "$USE_API_KEY" = true ]; then
+            xcodebuild -exportArchive \
+              -archivePath build/Runner.xcarchive \
+              -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
+              -exportPath build/ipa \
+              -authenticationKeyPath "${API_KEY_PATH}" \
+              -authenticationKeyID "$API_KEY_ID" \
+              -authenticationKeyIssuerID "$API_ISSUER_ID" \
+              -allowProvisioningUpdates
+          else
+            xcodebuild -exportArchive \
+              -archivePath build/Runner.xcarchive \
+              -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
+              -exportPath build/ipa \
+              -allowProvisioningUpdates
+          fi
+          
+          echo ""
+          echo "==================================="
+          echo "✅ IPA Export Successful!"
+          echo "==================================="
+          echo "📦 Export Method: $EXPORT_METHOD"
+          if [ "$USE_API_KEY" = true ]; then
+            echo "🔐 Signing: Automatic (API Key)"
+          else
+            echo "🔐 Signing: Manual"
+          fi
+          echo "📱 Installable on all registered devices"
+          echo ""
+          
+          ls -lh build/ipa/*.ipa || ls -la build/ipa
+
+      - name: Upload IPA artifact
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: build/ipa/*.ipa
